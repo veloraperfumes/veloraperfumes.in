@@ -6,6 +6,9 @@
 <title>VELORA — Fragrance Catalog</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,500&family=Work+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<!-- Firebase (compat SDK) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <style>
   :root{
     --ink:#4E0030;
@@ -435,11 +438,28 @@ const DEFAULT_PRODUCTS = [
   { name:"Aventus Edge", inspiredBy:"Inspired by Aventus", price:750, oldPrice:1500, mood:["office","gym"], image:null, notes:{ top:"Pineapple, blackcurrant", heart:"Birch, jasmine", base:"Musk, oakmoss" } }
 ];
 
+/* =========================================================
+   FIREBASE
+   ========================================================= */
+// 1. Go to https://console.firebase.google.com -> create a project
+// 2. Build > Firestore Database > Create database (start in test mode, or set rules below)
+// 3. Project settings (gear icon) > General > Your apps > Add app (Web) > copy the config below
+const firebaseConfig = {
+  apiKey: "AIzaSyC27Nqg_TRfb9kFbT-F1B6OYToELo8lFhA",
+  authDomain: "velora-1d12f.firebaseapp.com",
+  projectId: "velora-1d12f",
+  storageBucket: "velora-1d12f.firebasestorage.app",
+  messagingSenderId: "304313583948",
+  appId: "1:304313583948:web:2b819cc3060dc8235927e9"
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
+const dataDocRef = db.collection("velora").doc("data"); // holds { products, banner }
+
 let PRODUCTS = [];
 let activeMood = "all";
 let isAdmin = false;
-const STORAGE_KEY = "velora:products";
-const BANNER_KEY = "velora:banner";
+const LOCAL_KEY = "velora:local-cache"; // used only as an instant-paint fallback
 
 function showToast(msg){
   const t = document.getElementById('toast');
@@ -449,24 +469,52 @@ function showToast(msg){
 }
 
 async function loadProducts(){
+  // Paint instantly from local cache (if any) so the page isn't empty while Firestore loads
   try{
-    const res = await window.storage.get(STORAGE_KEY, true);
-    PRODUCTS = res && res.value ? JSON.parse(res.value) : DEFAULT_PRODUCTS;
+    const cached = localStorage.getItem(LOCAL_KEY);
+    if(cached){
+      const parsed = JSON.parse(cached);
+      if(parsed.products) PRODUCTS = parsed.products;
+    }
+  }catch(e){}
+  if(!PRODUCTS.length) PRODUCTS = DEFAULT_PRODUCTS;
+  renderProducts();
+  document.getElementById('statCount').textContent = PRODUCTS.length;
+
+  try{
+    const snap = await dataDocRef.get();
+    if(snap.exists && snap.data().products){
+      PRODUCTS = snap.data().products;
+    }else{
+      PRODUCTS = DEFAULT_PRODUCTS;
+    }
   }catch(e){
-    PRODUCTS = DEFAULT_PRODUCTS;
+    console.error("Firestore load failed:", e);
+    showToast("Couldn't reach the database, showing saved copy");
   }
   renderProducts();
   document.getElementById('statCount').textContent = PRODUCTS.length;
+  cacheLocally();
 }
 
 async function saveProducts(){
   try{
-    await window.storage.set(STORAGE_KEY, JSON.stringify(PRODUCTS), true);
+    await dataDocRef.set({ products: PRODUCTS }, { merge: true });
   }catch(e){
+    console.error("Firestore save failed:", e);
     showToast("Couldn't save, please try again");
   }
+  cacheLocally();
   renderProducts();
   document.getElementById('statCount').textContent = PRODUCTS.length;
+}
+
+function cacheLocally(){
+  try{
+    const existing = JSON.parse(localStorage.getItem(LOCAL_KEY) || "{}");
+    existing.products = PRODUCTS;
+    localStorage.setItem(LOCAL_KEY, JSON.stringify(existing));
+  }catch(e){}
 }
 
 function waLink(productName){
@@ -517,13 +565,18 @@ function renderProducts(){
         <div class="note-text">${p.notes.top} · ${p.notes.heart} · ${p.notes.base}</div>
       </div>
       <div class="card-bottom">
-        <button class="order-btn" onclick="window.open('${waLink(p.name)}','_blank')">
+        <button class="order-btn" data-order-name="${p.name.replace(/"/g,'&quot;')}">
           <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.5 3.5A11.8 11.8 0 0 0 12 0C5.4 0 .1 5.3.1 11.9c0 2.1.5 4.1 1.6 5.9L0 24l6.4-1.7a11.9 11.9 0 0 0 5.6 1.4h.1c6.6 0 11.9-5.3 11.9-11.9 0-3.2-1.2-6.1-3.5-8.3zM12 21.3h-.1a9.4 9.4 0 0 1-4.8-1.3l-.3-.2-3.6 1 1-3.5-.2-.4a9.4 9.4 0 0 1-1.4-5 9.4 9.4 0 0 1 9.4-9.4 9.3 9.3 0 0 1 9.4 9.4c0 5.2-4.2 9.4-9.4 9.4z"/></svg>
           Order Now
         </button>
       </div>
     </div>
   `).join('');
+  grid.querySelectorAll('.order-btn').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      window.open(waLink(btn.dataset.orderName), '_blank');
+    });
+  });
 }
 
 function setGlobalWaLinks(){
@@ -723,12 +776,23 @@ document.getElementById('formSave').addEventListener('click', async ()=>{
 
 /* ---------- Init ---------- */
 async function loadBanner(){
+  // Instant paint from local cache
   try{
-    const res = await window.storage.get(BANNER_KEY, true);
-    const url = res && res.value ? res.value : null;
+    const cached = JSON.parse(localStorage.getItem(LOCAL_KEY) || "{}");
+    if(cached.banner) applyBanner(cached.banner);
+  }catch(e){}
+
+  try{
+    const snap = await dataDocRef.get();
+    const url = snap.exists && snap.data().banner ? snap.data().banner : null;
     applyBanner(url);
+    try{
+      const existing = JSON.parse(localStorage.getItem(LOCAL_KEY) || "{}");
+      existing.banner = url;
+      localStorage.setItem(LOCAL_KEY, JSON.stringify(existing));
+    }catch(e){}
   }catch(e){
-    applyBanner(null);
+    console.error("Firestore banner load failed:", e);
   }
 }
 
@@ -756,10 +820,16 @@ document.getElementById('fBanner').addEventListener('change', (e)=>{
 document.getElementById('saveBannerBtn').addEventListener('click', async ()=>{
   if(!currentBannerData) return;
   try{
-    await window.storage.set(BANNER_KEY, currentBannerData, true);
+    await dataDocRef.set({ banner: currentBannerData }, { merge: true });
     applyBanner(currentBannerData);
+    try{
+      const existing = JSON.parse(localStorage.getItem(LOCAL_KEY) || "{}");
+      existing.banner = currentBannerData;
+      localStorage.setItem(LOCAL_KEY, JSON.stringify(existing));
+    }catch(e){}
     showToast("Banner updated");
   }catch(e){
+    console.error("Firestore banner save failed:", e);
     showToast("Couldn't save banner, please try again");
   }
 });
@@ -769,7 +839,14 @@ document.getElementById('removeBannerBtn').addEventListener('click', async ()=>{
   document.getElementById('fBanner').value = '';
   document.getElementById('bannerPreviewWrap').style.display = 'none';
   try{
-    await window.storage.delete(BANNER_KEY, true);
+    await dataDocRef.set({ banner: null }, { merge: true });
+  }catch(e){
+    console.error("Firestore banner remove failed:", e);
+  }
+  try{
+    const existing = JSON.parse(localStorage.getItem(LOCAL_KEY) || "{}");
+    existing.banner = null;
+    localStorage.setItem(LOCAL_KEY, JSON.stringify(existing));
   }catch(e){}
   applyBanner(null);
   showToast("Banner removed");
